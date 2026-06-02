@@ -1,0 +1,70 @@
+---
+title: Context
+description: The object passed to every durable workflow — declare steps with ctx.step.
+---
+
+A `Context` is passed as the first argument (`ctx`) to every `@durable`
+function. You don't construct it yourself; the decorator creates one per
+invocation.
+
+## ctx.step
+
+```python
+ctx.step(name, fn, undo=None)
+```
+
+Runs `fn` **exactly once** across all invocations of this run.
+
+<ParamField path="name" type="str" required>
+  The step's name. Combined with the run ID, it forms the idempotency key.
+  Must be unique within a run.
+</ParamField>
+
+<ParamField path="fn" type="Callable[[], Any]" required>
+  A zero-argument callable that performs the step. Its return value is
+  committed to the log and returned. On replay, `fn` is **not** called —
+  the cached result is returned instead.
+</ParamField>
+
+<ParamField path="undo" type="Callable[[], Any]" default="None">
+  A zero-argument compensating action. If a **later** step raises, this step's
+  `undo` is called during the reverse-order unwind. Steps without an `undo` are
+  skipped during rollback.
+</ParamField>
+
+**Returns:** the step's result — freshly computed on first run, or the cached
+value from the log on replay.
+
+```python
+@durable
+def book_trip(ctx, dest, amount):
+    charge = ctx.step("charge", lambda: pay(amount), undo=lambda: refund(amount))
+    seat   = ctx.step("reserve", lambda: hold(dest))
+    return seat
+```
+
+## Attributes
+
+<ResponseField name="run_id" type="str">
+  The idempotency key for this run.
+</ResponseField>
+
+<ResponseField name="events" type="list[tuple[str, str]]">
+  Ordered observability trail of what happened this invocation. Each entry is
+  `(step_name, status)` where status is one of `"executed"`, `"skipped"`,
+  `"rolled_back"`, or `"undo_failed"`. Great for tests and demos.
+</ResponseField>
+
+<ResponseField name="rolled_back" type="list[str]">
+  Names of steps whose `undo` fired during a saga unwind.
+</ResponseField>
+
+## Behaviour notes
+
+- **Commit-before-continue.** A step's result is written to the WAL *before*
+  the next line of your function runs, so a crash can never lose a committed
+  step.
+- **Replayed steps still register their undo.** A step skipped on resume is
+  still pushed onto the saga stack, so a later failure correctly rolls it back.
+- **Best-effort unwind.** If an `undo` itself raises, dura records
+  `undo_failed` and continues unwinding the remaining steps.

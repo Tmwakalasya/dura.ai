@@ -1,0 +1,48 @@
+---
+title: Exactly-once
+description: How dura guarantees a step's side effect fires once, even across crashes and retries.
+---
+
+## At-least-once is not enough
+
+Most retry systems give you **at-least-once**: if something might have failed,
+run it again. That's fine for idempotent reads. It's a disaster for a card
+charge, an email, or a booking — the action can fire twice.
+
+dura gives you **exactly-once** for the steps you wrap.
+
+## How
+
+Each run has a deterministic **run ID**, derived from the function name plus
+its inputs (a SHA-256 prefix). Within a run, each step has a name. The pair
+`(run_id, step_name)` is the idempotency key.
+
+- Before executing a step, dura looks up that key in the log.
+- If it's present, the committed result is returned and `fn` never runs.
+- If it's absent, `fn` runs, the result is committed, then returned.
+
+```python
+@durable
+def flow(ctx):
+    return ctx.step("compute", lambda: expensive_call())
+
+flow(log="run.db")   # executes expensive_call(), commits the result
+flow(log="run.db")   # returns the SAME result from the log — no second call
+```
+
+## The `MISSING` sentinel
+
+A step can legitimately return `None`. To distinguish "committed `None`" from
+"never committed," the WAL uses a `MISSING` sentinel internally rather than
+treating `None` as absent. A step that returned `None` is still skipped on replay.
+
+## Known limitation: concurrency
+
+Today there is no single-writer claim. If **two workers race the same run**,
+both can pass the "is it committed?" check before either commits, and both
+execute the side effect. This is documented honestly as an `xfail` in the test
+suite. The roadmap fix is a `claim` row written to the WAL before execution, so
+only one worker wins the step.
+
+For single-worker resume — the overwhelmingly common case — exactly-once holds
+across real process death.

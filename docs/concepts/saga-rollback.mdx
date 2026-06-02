@@ -1,0 +1,59 @@
+---
+title: Saga rollback
+description: When a step fails, completed steps undo in reverse order.
+---
+
+## Partial failure is the hard case
+
+Crash-and-resume handles the case where you want to *finish* the workflow. But
+sometimes a workflow can't finish — the flight has no seats after you've
+already charged the card. You don't want to retry forever; you want to **undo
+what you did** and bail out cleanly.
+
+This is the [saga pattern](https://microservices.io/patterns/data/saga.html):
+every step that has a side effect also has a **compensating action** that
+reverses it.
+
+## The `undo=` argument
+
+```python
+@durable
+def book_trip(ctx, dest, amount):
+    ctx.step("charge_card", lambda: charge(amount),
+             undo=lambda: refund(amount))          # compensating action
+    ctx.step("book_flight", lambda: book_flight(dest))   # 💥 no seats
+```
+
+If `book_flight` raises, dura unwinds: it walks the completed steps **in
+reverse commit order** and calls each one's `undo`. So `charge_card`'s refund
+fires, the customer is made whole, and the original exception propagates so the
+caller knows the workflow failed.
+
+## Rules
+
+- **Only completed steps roll back.** The step that *failed* never had its
+  side effect succeed, so its `undo` does not fire.
+- **Reverse order.** `a, b, c` completed → unwind runs `undo_c, undo_b, undo_a`.
+  This matters when later steps depend on earlier ones.
+- **No `undo`, no-op.** A step without a compensating action is simply skipped
+  during unwind — nothing to compensate.
+- **Resume-safe.** A step replayed from the log still registers its `undo`, so
+  a failure *after* resume rolls back steps that were committed in an earlier
+  process.
+
+## Worked example
+
+```text
+WITHOUT dura:  customer out $412, no flight       ❌ orphaned charge
+WITH dura:     balance held $0, auto-refunded      ✅ clean
+```
+
+Run it yourself:
+
+```bash
+python examples/side_by_side.py
+```
+
+<Card title="Cookbook: booking with refund" icon="rotate-left" href="/cookbook/booking-with-refund">
+  The full booking saga, end to end.
+</Card>

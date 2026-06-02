@@ -1,0 +1,49 @@
+---
+title: Durable execution
+description: Why a write-ahead log makes agent workflows crash-proof.
+---
+
+## The problem
+
+An agent does real work: it charges a card, books a flight, updates a CRM.
+These steps have **side effects in the outside world**. If the process dies
+halfway through — an OOM kill, a deploy, a crashed container — the naive
+recovery is to re-run from the top. But re-running charges the card *again*.
+
+Retries are dangerous precisely because the dangerous steps already happened.
+
+## The mechanism
+
+dura records the result of each step to a **write-ahead log (WAL)** *before*
+the workflow is allowed to continue:
+
+1. You call `ctx.step("charge_card", fn)`.
+2. dura checks the log. If `charge_card` is already committed for this run, it
+   returns the cached result **without executing `fn`**.
+3. Otherwise it runs `fn`, commits the result to the WAL, then returns it.
+
+Because the commit happens *before* the next line of your function runs, there
+is no window where a step ran but wasn't recorded. A crash either happens
+before the commit (so the step replays cleanly) or after (so it's skipped on
+resume). Either way: **exactly-once**.
+
+## Resuming
+
+dura derives a deterministic run ID from the function name and its inputs.
+"Restarting after a crash" is just calling the function again with the same
+arguments pointing at the same log:
+
+```python
+book_trip("Tokyo", 412)   # crashes after charge_card commits
+book_trip("Tokyo", 412)   # resumes — charge_card is skipped, picks up at book_flight
+```
+
+The WAL is a SQLite database, so it survives process death, container restarts,
+and machine reboots. The guarantee is not "we caught the exception" — it's
+"the record was on disk before we moved on." We prove this with a real
+`SIGKILL` test in the test suite: an uncatchable kill mid-workflow, then a
+fresh-process restart that fires the side effect exactly once.
+
+<Card title="Next: exactly-once" icon="fingerprint" href="/concepts/exactly-once">
+  How run IDs and idempotency keys make replay safe.
+</Card>

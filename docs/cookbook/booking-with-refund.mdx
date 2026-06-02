@@ -1,0 +1,52 @@
+---
+title: Booking with refund
+description: A full booking saga — charge, reserve, confirm — that unwinds cleanly on failure.
+---
+
+This is the end-to-end saga behind the `side_by_side.py` demo. Three steps with
+side effects, each with a compensating action, so any failure leaves the system
+in a clean state.
+
+```python
+from dura import durable
+
+@durable
+def book_trip(ctx, dest, amount):
+    ctx.step(
+        "charge_card",
+        lambda: payments.charge(amount),
+        undo=lambda: payments.refund(amount),
+    )
+    seat = ctx.step(
+        "reserve_seat",
+        lambda: inventory.reserve(dest),
+        undo=lambda: inventory.release(dest),
+    )
+    ctx.step(
+        "confirm_booking",
+        lambda: bookings.confirm(seat),
+        undo=lambda: bookings.cancel(seat),
+    )
+```
+
+### Failure scenarios
+
+| Fails at | Completed before it | Unwind order |
+|----------|--------------------|--------------|
+| `reserve_seat` | `charge_card` | refund |
+| `confirm_booking` | `charge_card`, `reserve_seat` | release seat → refund |
+
+The unwind always runs in **reverse commit order**, so dependencies undo
+safely. The failing step's own `undo` never fires because its side effect never
+succeeded.
+
+### Try it
+
+```bash
+python examples/side_by_side.py
+```
+
+```text
+WITHOUT dura:  customer out $412, no flight       ❌ orphaned charge
+WITH dura:     balance held $0, auto-refunded      ✅ clean
+```
