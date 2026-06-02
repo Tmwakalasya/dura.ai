@@ -6,8 +6,8 @@ re-running the workflow replays the log: completed steps return their
 cached result instead of executing again (exactly-once).
 """
 
-from dura.runtime import durable, Context, SimulatedCrash
+from dura.runtime import durable, Context, SimulatedCrash, StepFailure
 from dura.log import WAL
 
-__all__ = ["durable", "Context", "SimulatedCrash", "WAL"]
+__all__ = ["durable", "Context", "SimulatedCrash", "StepFailure", "WAL"]
 __version__ = "0.0.1"
