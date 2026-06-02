@@ -1,0 +1,78 @@
+---
+title: "@durable"
+description: The decorator that makes a function a durable workflow.
+---
+
+```python
+from dura import durable
+```
+
+## Signature
+
+```python
+@durable
+def workflow(ctx, *args, **kwargs): ...
+
+# or with options:
+@durable(log="path/to/run.db")
+def workflow(ctx, *args, **kwargs): ...
+```
+
+`@durable` wraps a function into a durable workflow. The decorated function
+receives a [`Context`](/api/context) as its first argument (`ctx`), which you
+use to declare steps.
+
+## Parameters
+
+<ParamField path="log" type="str" default="dura.db">
+  Path to the SQLite write-ahead log. All step results for the run are
+  committed here. Pass a per-run path (or include a unique ID in the inputs)
+  to isolate independent runs.
+</ParamField>
+
+## Call-time keyword arguments
+
+Beyond your own arguments, the wrapped function accepts these reserved kwargs:
+
+<ParamField path="log" type="str">
+  Overrides the decorator's log path for this invocation.
+  `workflow(arg1, arg2, log="orders/order_42.db")`
+</ParamField>
+
+<ParamField path="run_id" type="str">
+  Overrides the derived idempotency key. Use when you want to control the run
+  identity explicitly instead of deriving it from the inputs.
+</ParamField>
+
+<ParamField path="crash_after" type="str">
+  Test/demo hook: raise `SimulatedCrash` right after the named step commits.
+</ParamField>
+
+## Run IDs
+
+dura derives a deterministic run ID from the function name plus its inputs
+(a SHA-256 prefix). Calling the function again with the **same inputs** against
+the **same log** resumes the existing run — completed steps are skipped. This
+is how "restart after a crash" works with no explicit run ID.
+
+## Attributes
+
+<ResponseField name="workflow.last_context" type="Context">
+  The `Context` from the most recent invocation. Useful in tests to inspect
+  `last_context.events` (e.g. `("step_name", "skipped")`) and
+  `last_context.rolled_back`.
+</ResponseField>
+
+## Exceptions
+
+<ResponseField name="SimulatedCrash">
+  Raised when a step matches the `crash_after=` test hook. Used to simulate a
+  crash at a known point in tests.
+</ResponseField>
+
+<ResponseField name="StepFailure">
+  Exception type exported for callers that want to raise a typed failure from
+  inside a step to trigger saga rollback. Note: when a step's `fn` raises, dura
+  runs the compensating actions and then **re-raises the original exception** —
+  it is not wrapped.
+</ResponseField>

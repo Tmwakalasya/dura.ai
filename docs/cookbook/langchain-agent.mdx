@@ -1,0 +1,50 @@
+---
+title: Wrap a LangChain agent
+description: Add durability to a tool-calling agent loop without rewriting it.
+---
+
+dura is framework-agnostic — it wraps plain Python functions, so it drops into
+a LangChain (or LlamaIndex, or raw OpenAI) agent loop with one decorator.
+
+The trick: make each **tool invocation** a `ctx.step`. The LLM call that
+*decides* the next action can re-run cheaply, but the tool's side effect is
+committed exactly once.
+
+```python
+from dura import durable
+from langchain.agents import AgentExecutor
+
+@durable
+def run_agent(ctx, task: str):
+    state = {"task": task, "history": []}
+
+    for i in range(MAX_STEPS):
+        # Deciding the next action is a pure-ish LLM call; name it per turn.
+        action = ctx.step(
+            f"decide_{i}",
+            lambda: agent.plan(state),
+        )
+        if action.is_finish:
+            return action.output
+
+        # The TOOL is the side effect. Committed exactly once.
+        result = ctx.step(
+            f"tool_{i}_{action.tool}",
+            lambda: action.run(),
+            undo=lambda: action.compensate() if action.reversible else None,
+        )
+        state["history"].append((action, result))
+```
+
+### Why this matters for agents
+
+Agents fail mid-loop constantly — a rate limit, a timeout, a bad tool response
+that crashes the runner. On retry, a naive loop re-runs **every tool call so
+far**, including the one that already sent the email or moved the money. With
+dura, the committed tool calls are skipped and the agent picks up exactly where
+it died.
+
+<Tip>
+Give each turn's steps a unique name (`tool_{i}_...`). The step name plus the
+run ID is the idempotency key, so distinct turns must have distinct names.
+</Tip>

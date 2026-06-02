@@ -1,0 +1,45 @@
+---
+title: Protect a Stripe charge
+description: Never double-charge a customer, even if the process dies mid-checkout.
+---
+
+The classic exactly-once case: charge a card, then do more work that might
+crash. Without durability, a retry charges again.
+
+```python
+import stripe
+from dura import durable
+
+@durable
+def checkout(ctx, customer_id, amount_cents):
+    # 1. The dangerous step. If we crash AFTER this, we must not repeat it.
+    charge = ctx.step(
+        "charge",
+        lambda: stripe.PaymentIntent.create(
+            amount=amount_cents,
+            currency="usd",
+            customer=customer_id,
+            confirm=True,
+        ),
+        undo=lambda: stripe.Refund.create(payment_intent=charge["id"]),
+    )
+
+    # 2. Crash here on a deploy? Resume skips the charge and starts fulfilment.
+    ctx.step("fulfil_order", lambda: warehouse.ship(customer_id))
+    ctx.step("send_receipt", lambda: email.receipt(customer_id, charge["id"]))
+
+    return charge["id"]
+```
+
+### What you get
+
+- **Crash after `charge`** → restart resumes at `fulfil_order`. The card is
+  **not** charged again.
+- **`fulfil_order` fails** (out of stock) → `charge`'s `undo` fires a Stripe
+  refund automatically. No orphaned money.
+
+<Note>
+Use the same `customer_id` and `amount_cents` on retry so dura derives the same
+run ID and resumes the existing run. For multiple distinct checkouts, pass an
+explicit `log=` per order or include an order ID in the inputs.
+</Note>

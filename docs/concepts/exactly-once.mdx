@@ -1,0 +1,64 @@
+---
+title: Exactly-once
+description: How dura guarantees a step's side effect fires once, even across crashes and retries.
+---
+
+## At-least-once is not enough
+
+Most retry systems give you **at-least-once**: if something might have failed,
+run it again. That's fine for idempotent reads. It's a disaster for a card
+charge, an email, or a booking — the action can fire twice.
+
+dura gives you **exactly-once** for the steps you wrap.
+
+## How
+
+Each run has a deterministic **run ID**, derived from the function name plus
+its inputs (a SHA-256 prefix). Within a run, each step has a name. The pair
+`(run_id, step_name)` is the idempotency key.
+
+- Before executing a step, dura looks up that key in the log.
+- If it's present, the committed result is returned and `fn` never runs.
+- If it's absent, `fn` runs, the result is committed, then returned.
+
+```python
+@durable
+def flow(ctx):
+    return ctx.step("compute", lambda: expensive_call())
+
+flow(log="run.db")   # executes expensive_call(), commits the result
+flow(log="run.db")   # returns the SAME result from the log — no second call
+```
+
+## The `MISSING` sentinel
+
+A step can legitimately return `None`. To distinguish "committed `None`" from
+"never committed," the WAL uses a `MISSING` sentinel internally rather than
+treating `None` as absent. A step that returned `None` is still skipped on replay.
+
+## Concurrency: the single-writer claim
+
+Exactly-once has to hold even when **two workers race the same run** — say, two
+replicas of your service both pick up the same job. dura handles this with a
+lease-based claim.
+
+Before executing a step, a worker must `claim` it: under a SQLite write lock,
+it writes a short-lived lease (`worker_id` + expiry) into the WAL. The write
+lock serializes claims, so exactly one worker comes away owning the step. The
+others see the claim, wait, and read the committed result once it lands —
+they never run the side effect.
+
+```text
+Worker A:  claim charge → ACQUIRED → runs charge → commits
+Worker B:  claim charge → HELD → waits → claim → DONE → reads cached result
+```
+
+### Surviving a worker that dies mid-step
+
+A lease has an expiry. If the worker holding a claim dies *while executing*
+(before it commits), the lease eventually expires and another worker steals it
+and runs the step. So crash-and-resume still works even when the crash happens
+in the middle of a step, not just between steps.
+
+This is verified in the test suite by two workers racing the same step
+(exactly-once) and by a stale-lease takeover test.

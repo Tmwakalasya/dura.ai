@@ -1,0 +1,66 @@
+---
+title: Quickstart
+description: Make any agent action exactly-once and crash-proof in two minutes.
+---
+
+## Install
+
+```bash
+pip install dura
+```
+
+Zero dependencies. Python 3.9+.
+
+## Wrap your agent
+
+```python
+from dura import durable
+
+@durable
+def book_trip(ctx, dest, amount):
+    ctx.step("charge_card", lambda: charge(amount),
+             undo=lambda: refund(amount))
+
+    flight = ctx.step("book_flight", lambda: book_flight(dest))
+    ctx.step("update_crm",  lambda: update_crm(flight))
+```
+
+That's the whole API. Every `ctx.step` call is:
+
+- **Exactly-once** — if the process crashes and restarts, completed steps are skipped.
+- **Rollback-able** — if a later step fails, completed steps undo in reverse order.
+- **Durable** — the return value is committed to a write-ahead log before the workflow continues.
+
+## Run it
+
+```python
+# First run — all three steps execute.
+book_trip("Tokyo", 412)
+
+# Process crashes here. Restart:
+book_trip("Tokyo", 412)   # charge_card is SKIPPED — already committed.
+```
+
+dura derives a run ID from the function name and inputs, so re-calling with the
+same arguments automatically resumes from the last checkpoint. No explicit run ID needed.
+
+## Verify it works
+
+```bash
+python -m pytest -q   # 15 passing, 1 xfail (known concurrency limitation)
+```
+
+<CardGroup cols={2}>
+  <Card title="How durable execution works" icon="bolt" href="/concepts/durable-execution">
+    The write-ahead log, replay, and exactly-once guarantees.
+  </Card>
+  <Card title="Saga rollback" icon="rotate-left" href="/concepts/saga-rollback">
+    How compensating actions unwind partial workflows on failure.
+  </Card>
+  <Card title="Protect a Stripe charge" icon="credit-card" href="/cookbook/protect-stripe">
+    Never double-charge a customer, even across crashes.
+  </Card>
+  <Card title="Wrap a LangChain agent" icon="robot" href="/cookbook/langchain-agent">
+    Add durability to any LangChain tool-calling loop.
+  </Card>
+</CardGroup>
