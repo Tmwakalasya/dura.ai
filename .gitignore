@@ -8,3 +8,11 @@
 next-env.d.ts
 .vercel
 /.next/cache
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+*.db
+.venv/
