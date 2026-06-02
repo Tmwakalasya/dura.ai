@@ -4,9 +4,9 @@ import { GeistMono } from "geist/font/mono";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "axon — crash-proof AI agents",
+  title: "dura — crash-proof AI agents",
   description:
-    "Durable execution for AI agents. Make any agent's actions atomic, exactly-once, and rollback-able. When an agent crashes mid-task, axon resumes it — no double-charges, no corrupted state.",
+    "Durable execution for AI agents. Make any agent's actions atomic, exactly-once, and rollback-able. When an agent crashes mid-task, dura resumes it — no double-charges, no corrupted state.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

@@ -25,7 +25,7 @@ export function DurableLog() {
         <span className="h-3 w-3 rounded-full bg-white/15" />
         <span className="h-3 w-3 rounded-full bg-white/15" />
         <span className="ml-3 font-mono text-xs text-white/40">
-          axon · run a91c · book_trip()
+          dura · run a91c · book_trip()
         </span>
         <span className="ml-auto rounded-full border border-accent/30 bg-accent/10 px-2 py-0.5 font-mono text-[10px] text-accent">
           recovered
