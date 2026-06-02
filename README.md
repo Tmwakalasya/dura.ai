@@ -40,4 +40,13 @@ python examples/side_by_side.py      # naive double-charge vs dura auto-refund
 - **Day 1** — core runtime: `@durable`, SQLite write-ahead log, exactly-once resume.
 - **Day 2** — saga rollback: `undo=` compensating actions, reverse-order unwind on failure.
 
-12 tests passing (`python -m pytest -q`). Next: docs + hosted cloud.
+**Testing.** 15 passing + 1 documented `xfail`:
+- Unit: exactly-once resume, multi-step resume, saga reverse-unwind, WAL.
+- Integration: a real `SIGKILL` mid-workflow + restart (exactly-once across an
+  actual process death), crash-after-every-step, durable return values.
+
+**Known limitation (roadmap).** No single-writer claim yet, so two workers
+racing the *same* run can both execute a step before either commits. Tracked as
+an `xfail` in `tests/test_integration.py`. Next: a `claim` row in the WAL.
+
+Run: `python -m pytest -v`. Next: docs + hosted cloud.
