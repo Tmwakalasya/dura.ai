@@ -1,4 +1,5 @@
-import { DurableLog } from "@/components/DurableLog";
+import { LiveDemo } from "@/components/LiveDemo";
+import { CodeBlock } from "@/components/CodeBlock";
 
 const NAV = ["Docs", "Pricing", "Blog"];
 
@@ -8,6 +9,7 @@ export default function Home() {
       {/* backdrop */}
       <div className="pointer-events-none absolute inset-0 bg-stars" />
       <div className="pointer-events-none absolute inset-0 grid-faint" />
+      <div className="pointer-events-none absolute left-1/2 top-[-10%] h-[520px] w-[820px] -translate-x-1/2 aurora" />
       <div className="pointer-events-none absolute inset-x-0 bottom-0 h-[60vh] fog" />
 
       {/* nav */}
@@ -71,9 +73,23 @@ export default function Home() {
         </div>
       </section>
 
-      {/* product mockup */}
+      {/* live interactive demo */}
       <section id="how" className="relative z-10 mx-auto mt-20 max-w-5xl px-6 pb-10 md:mt-28">
-        <DurableLog />
+        <p className="mb-4 text-center font-mono text-xs text-white/40">
+          live — watch it crash mid-charge and resume exactly-once
+        </p>
+        <LiveDemo />
+      </section>
+
+      {/* the API */}
+      <section className="relative z-10 mx-auto max-w-3xl px-6 py-16">
+        <h2 className="mb-2 text-center text-2xl font-semibold tracking-tight md:text-3xl">
+          One decorator. That&apos;s the whole API.
+        </h2>
+        <p className="mx-auto mb-8 max-w-md text-center text-sm text-white/50">
+          No rewrite, no workflow DSL. Wrap the agent you already have.
+        </p>
+        <CodeBlock />
       </section>
 
       {/* the contrast */}

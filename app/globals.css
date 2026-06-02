@@ -36,6 +36,29 @@ body {
   );
 }
 
+.aurora {
+  background: radial-gradient(
+    50% 50% at 50% 50%,
+    rgba(232, 84, 63, 0.18) 0%,
+    rgba(232, 84, 63, 0.06) 40%,
+    transparent 70%
+  );
+  filter: blur(40px);
+  animation: aurora-drift 9s ease-in-out infinite;
+}
+
+@keyframes aurora-drift {
+  0%,
+  100% {
+    transform: translateX(-50%) scale(1);
+    opacity: 0.8;
+  }
+  50% {
+    transform: translateX(-50%) scale(1.12);
+    opacity: 1;
+  }
+}
+
 .grid-faint {
   background-image:
     linear-gradient(to right, rgba(255, 255, 255, 0.04) 1px, transparent 1px),
