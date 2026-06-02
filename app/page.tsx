@@ -14,7 +14,7 @@ export default function Home() {
       <header className="relative z-10 mx-auto flex max-w-6xl items-center justify-between px-6 py-5">
         <div className="flex items-center gap-2">
           <span className="inline-block h-2.5 w-2.5 rounded-full bg-accent animate-pulseline" />
-          <span className="font-mono text-[15px] font-medium tracking-tight">deadcheck</span>
+          <span className="font-mono text-[15px] font-medium tracking-tight">axon</span>
         </div>
         <nav className="hidden items-center gap-8 md:flex">
           {NAV.map((item) => (
@@ -49,7 +49,7 @@ export default function Home() {
             Your state shouldn&apos;t.
           </h1>
           <p className="mx-auto mt-6 max-w-xl text-pretty text-base leading-relaxed text-white/55 md:text-lg">
-            Wrap any agent in one decorator. deadcheck makes every action atomic,
+            Wrap any agent in one decorator. axon makes every action atomic,
             exactly-once, and rollback-able — so a crash mid-task never means a
             double-charge or corrupted state.
           </p>
@@ -67,7 +67,7 @@ export default function Home() {
               See how it works
             </a>
           </div>
-          <div className="mt-5 font-mono text-xs text-white/35">$ pip install deadcheck</div>
+          <div className="mt-5 font-mono text-xs text-white/35">$ pip install axon</div>
         </div>
       </section>
 
@@ -84,7 +84,7 @@ export default function Home() {
         <div className="grid gap-4 md:grid-cols-2">
           <div className="rounded-2xl border border-line bg-surface/60 p-6">
             <div className="mb-3 flex items-center gap-2 text-sm font-medium text-white/70">
-              <span className="h-2 w-2 rounded-full bg-red-500/80" /> Without deadcheck
+              <span className="h-2 w-2 rounded-full bg-red-500/80" /> Without axon
             </div>
             <ul className="space-y-2.5 font-mono text-sm text-white/50">
               <li>→ charge_card() ✓</li>
@@ -96,7 +96,7 @@ export default function Home() {
           </div>
           <div className="rounded-2xl border border-accent/30 bg-accent/[0.06] p-6">
             <div className="mb-3 flex items-center gap-2 text-sm font-medium text-white/80">
-              <span className="h-2 w-2 rounded-full bg-accent" /> With deadcheck
+              <span className="h-2 w-2 rounded-full bg-accent" /> With axon
             </div>
             <ul className="space-y-2.5 font-mono text-sm text-white/70">
               <li>→ charge_card() ✓ — checkpointed</li>
@@ -141,7 +141,7 @@ export default function Home() {
 
       <footer className="relative z-10 border-t border-line">
         <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-6 text-xs text-white/35">
-          <span className="font-mono">deadcheck</span>
+          <span className="font-mono">axon</span>
           <span>© {new Date().getFullYear()} — built for agents that don&apos;t die quietly</span>
         </div>
       </footer>
@@ -163,6 +163,6 @@ const FEATURES = [
   {
     tag: "03 / reversible",
     title: "Saga rollback",
-    body: "Register compensating actions. When a multi-step task fails halfway, deadcheck unwinds completed steps to leave clean state.",
+    body: "Register compensating actions. When a multi-step task fails halfway, axon unwinds completed steps to leave clean state.",
   },
 ];
