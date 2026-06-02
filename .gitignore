@@ -16,3 +16,5 @@ __pycache__/
 .pytest_cache/
 *.db
 .venv/
+report_*.md
+research_*.db
