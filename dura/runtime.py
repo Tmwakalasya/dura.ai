@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from functools import wraps
 from typing import Any, Callable, Optional
 
-from dura.log import WAL, MISSING
+from dura.log import WAL, MISSING, ACQUIRED, DONE, HELD
 
 
 class SimulatedCrash(Exception):
@@ -63,12 +64,27 @@ class Context:
         If `fn` raises, the saga unwind fires before the exception propagates:
         every completed step's `undo` is called in reverse-commit order.
         """
+        # Fast path: already committed — replay without taking a write lock.
         cached = self.wal.get(self.run_id, name)
         if cached is not MISSING:
             # Still register the undo so a later failure can unwind this step.
             self._completed.append((name, undo))
             self.events.append((name, "skipped"))
             return cached
+
+        # Claim the step so a racing worker can't also execute it. If another
+        # worker holds the claim, wait until it commits (then read the result)
+        # or its lease expires (then we take over).
+        while True:
+            state = self.wal.claim(self.run_id, name)
+            if state == ACQUIRED:
+                break
+            if state == DONE:
+                self._completed.append((name, undo))
+                self.events.append((name, "skipped"))
+                return self.wal.get(self.run_id, name)
+            # state == HELD: another live worker is executing — wait and retry.
+            time.sleep(0.05)
 
         try:
             result = fn()

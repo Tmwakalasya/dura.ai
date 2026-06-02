@@ -105,32 +105,59 @@ def test_results_persist_across_a_fresh_interpreter(tmp_path):
     assert ("compute", "skipped") in flow.last_context.events
 
 
-@pytest.mark.xfail(
-    reason="single-writer claim not yet implemented; concurrent workers on the "
-    "same run can both execute a step before either commits. Roadmap item.",
-    strict=False,
-)
-def test_concurrent_workers_do_not_double_execute(tmp_path):
-    """Documents a known limitation honestly: two workers racing the same step.
-
-    Today there is no row-level claim before execution, so both can run the
-    side effect. Marked xfail until a `claim` step is added to the WAL.
+def test_concurrent_workers_execute_a_step_exactly_once(tmp_path):
+    """Two workers race the same run; the single-writer claim lets only one
+    execute the side effect. The loser waits, then reads the committed result.
     """
     log = str(tmp_path / "run.db")
     calls: collections.Counter = collections.Counter()
-    barrier = threading.Barrier(2)
+
+    def charge():
+        calls.update(["charge"])
+        # Hold the claim long enough that the other worker is forced to wait
+        # on it rather than slipping past before we commit.
+        time.sleep(0.2)
+        return {"id": "ch_1"}
 
     @durable
     def flow(ctx):
-        def charge():
-            barrier.wait()  # force both threads into the step simultaneously
-            calls.update(["charge"])
-        ctx.step("charge", charge)
+        return ctx.step("charge", charge)
 
-    threads = [threading.Thread(target=lambda: flow(log=log)) for _ in range(2)]
+    results: dict[int, Any] = {}
+
+    def run(i: int) -> None:
+        results[i] = flow(log=log)
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(2)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
 
+    # The side effect fired once...
     assert calls["charge"] == 1
+    # ...and both workers came away with the same committed result.
+    assert results[0] == results[1] == {"id": "ch_1"}
+
+
+def test_a_stale_claim_is_taken_over_after_the_lease_expires(tmp_path):
+    """If a worker dies holding a claim, another worker steals the expired
+    lease and completes the step — so a crash mid-execution still resumes.
+    """
+    from dura.log import WAL, ACQUIRED
+
+    log = str(tmp_path / "run.db")
+
+    # Worker A claims the step with a tiny lease, then "dies" (never commits).
+    a = WAL(log)
+    assert a.claim("run-1", "charge", lease=0.1) == ACQUIRED
+
+    # The lease expires; worker B can take it over.
+    time.sleep(0.15)
+    b = WAL(log)
+    assert b.claim("run-1", "charge") == ACQUIRED
+    b.put("run-1", "charge", {"id": "ch_1"})
+
+    assert b.get("run-1", "charge") == {"id": "ch_1"}
+    a.close()
+    b.close()
