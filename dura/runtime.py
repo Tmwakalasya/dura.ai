@@ -1,7 +1,9 @@
 """The durable runtime: the @durable decorator and the step context.
 
-Core guarantee (the whole product in one sentence):
-  a step that has already committed to the log never executes again.
+Core guarantees:
+  1. A step that has already committed to the log never executes again.
+  2. If a step raises, every previously-completed step's undo fires in
+     reverse order (saga pattern) — leaving the world in a clean state.
 """
 
 from __future__ import annotations
@@ -16,6 +18,10 @@ from dura.log import WAL, MISSING
 
 class SimulatedCrash(Exception):
     """Raised to model a process dying mid-workflow (for tests/demos)."""
+
+
+class StepFailure(Exception):
+    """Raised by a step's fn to trigger saga rollback."""
 
 
 def _derive_run_id(name: str, args: tuple, kwargs: dict) -> str:
@@ -36,31 +42,62 @@ class Context:
         self.wal = wal
         self.run_id = run_id
         self.crash_after = crash_after
+        # Ordered list of (step_name, undo_fn) for completed steps — saga stack.
+        self._completed: list[tuple[str, Optional[Callable[[], Any]]]] = []
         # Observability for the demo: what happened on this invocation.
         self.events: list[tuple[str, str]] = []
+        # Steps that were rolled back.
+        self.rolled_back: list[str] = []
 
-    def step(self, name: str, fn: Callable[[], Any]) -> Any:
+    def step(
+        self,
+        name: str,
+        fn: Callable[[], Any],
+        undo: Optional[Callable[[], Any]] = None,
+    ) -> Any:
         """Run `fn` exactly once across all invocations of this run.
 
-        If `name` is already in the log, return its result without executing.
-        Otherwise execute, commit the result, then continue.
+        If `name` is already in the log, return its cached result.
+        Otherwise execute, commit, then continue.
+
+        If `fn` raises, the saga unwind fires before the exception propagates:
+        every completed step's `undo` is called in reverse-commit order.
         """
         cached = self.wal.get(self.run_id, name)
         if cached is not MISSING:
+            # Still register the undo so a later failure can unwind this step.
+            self._completed.append((name, undo))
             self.events.append((name, "skipped"))
             return cached
 
-        result = fn()
-        # Commit BEFORE we continue — so a crash after this line can't lose it.
+        try:
+            result = fn()
+        except Exception as exc:
+            # This step failed — unwind everything that came before it.
+            self._unwind()
+            raise exc
+
+        # Commit BEFORE continuing — crash here can't lose this result.
         self.wal.put(self.run_id, name, result)
+        self._completed.append((name, undo))
         self.events.append((name, "executed"))
 
-        # Model a crash that happens after the step committed but before the
-        # workflow finished. On restart this step will be skipped.
         if self.crash_after == name:
             raise SimulatedCrash(name)
 
         return result
+
+    def _unwind(self) -> None:
+        """Fire compensating actions in reverse-commit order (saga rollback)."""
+        for name, undo_fn in reversed(self._completed):
+            if undo_fn is not None:
+                try:
+                    undo_fn()
+                    self.rolled_back.append(name)
+                    self.events.append((name, "rolled_back"))
+                except Exception:
+                    # Best-effort: log and continue unwinding.
+                    self.events.append((name, "undo_failed"))
 
 
 def durable(_fn: Optional[Callable] = None, *, log: str = "dura.db") -> Callable:
@@ -87,7 +124,6 @@ def durable(_fn: Optional[Callable] = None, *, log: str = "dura.db") -> Callable
             try:
                 return fn(ctx, *args, **kwargs)
             finally:
-                # Expose the context on the wrapper for inspection in demos/tests.
                 wrapper.last_context = ctx  # type: ignore[attr-defined]
 
         return wrapper
