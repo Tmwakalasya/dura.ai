@@ -1,0 +1,66 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "dura",
+  "colors": {
+    "primary": "#e8543f",
+    "light": "#f07060",
+    "dark": "#c04030"
+  },
+  "favicon": "/favicon.svg",
+  "navigation": {
+    "groups": [
+      {
+        "group": "Getting started",
+        "pages": [
+          "quickstart"
+        ]
+      },
+      {
+        "group": "Concepts",
+        "pages": [
+          "concepts/durable-execution",
+          "concepts/exactly-once",
+          "concepts/saga-rollback"
+        ]
+      },
+      {
+        "group": "Cookbook",
+        "pages": [
+          "cookbook/protect-stripe",
+          "cookbook/langchain-agent",
+          "cookbook/booking-with-refund"
+        ]
+      },
+      {
+        "group": "API reference",
+        "pages": [
+          "api/durable",
+          "api/context"
+        ]
+      }
+    ]
+  },
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "GitHub",
+        "href": "https://github.com/Tmwakalasya/dura.ai"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Get started",
+      "href": "https://dura.ai"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/Tmwakalasya/dura.ai"
+    }
+  }
+}
