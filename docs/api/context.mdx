@@ -1,70 +1,161 @@
 ---
 title: Context
-description: The object passed to every durable workflow — declare steps with ctx.step.
+description: The object passed to every durable workflow — declare steps, inspect events.
 ---
 
 A `Context` is passed as the first argument (`ctx`) to every `@durable`
-function. You don't construct it yourself; the decorator creates one per
+function. You never construct one yourself; the decorator creates it per
 invocation.
+
+---
 
 ## ctx.step
 
 ```python
-ctx.step(name, fn, undo=None)
+ctx.step(name: str, fn: Callable[[], Any], undo: Callable[[], Any] | None = None) -> Any
 ```
 
-Runs `fn` **exactly once** across all invocations of this run.
+Runs `fn` exactly once across all invocations of this run. On replay (crash-resume),
+returns the committed result without calling `fn`.
+
+### Parameters
 
 <ParamField path="name" type="str" required>
-  The step's name. Combined with the run ID, it forms the idempotency key.
-  Must be unique within a run.
+  The step's name within this run. Combined with the run ID, it forms the
+  idempotency key. Must be **unique within a run** — reusing a name returns the
+  first committed result for that name, regardless of what `fn` does.
+
+  ```python
+  # Good: unique names
+  ctx.step("charge_card", ...)
+  ctx.step("book_flight", ...)
+
+  # Good: unique names in a loop
+  for i, query in enumerate(queries):
+      ctx.step(f"search_{i}", lambda q=query: search(q))
+
+  # Bad: same name in a loop — all iterations return the first result
+  for query in queries:
+      ctx.step("search", lambda: search(query))   # BUG
+  ```
 </ParamField>
 
 <ParamField path="fn" type="Callable[[], Any]" required>
-  A zero-argument callable that performs the step. Its return value is
-  committed to the log and returned. On replay, `fn` is **not** called —
-  the cached result is returned instead.
+  A zero-argument callable that performs the step's work. Its return value must
+  be JSON-serialisable (dict, list, str, int, float, bool, None) — it is
+  committed to the log as JSON.
+
+  On replay, `fn` is **not called**. The committed JSON is deserialised and
+  returned.
+
+  ```python
+  # Capture loop variables explicitly to avoid closure bugs
+  for i, item in enumerate(items):
+      ctx.step(f"process_{i}", lambda x=item: process(x))   # correct
+      ctx.step(f"process_{i}", lambda: process(item))         # BUG — captures last item
+  ```
 </ParamField>
 
 <ParamField path="undo" type="Callable[[], Any]" default="None">
-  A zero-argument compensating action. If a **later** step raises, this step's
-  `undo` is called during the reverse-order unwind. Steps without an `undo` are
-  skipped during rollback.
+  A zero-argument compensating action. If a **later** step raises an exception,
+  this step's `undo` is called during the reverse-order saga unwind.
+
+  The `undo` lambda typically captures the step's result from the enclosing
+  scope so it can reference the IDs needed to reverse the operation:
+
+  ```python
+  charge = ctx.step(
+      "charge",
+      lambda: stripe.charge(amount),
+      undo=lambda: stripe.refund(charge["id"]),  # charge captured by reference
+  )
+  ```
+
+  Steps without an `undo` are silently skipped during unwind. You don't need
+  to provide one for idempotent or non-reversible steps.
 </ParamField>
 
-**Returns:** the step's result — freshly computed on first run, or the cached
-value from the log on replay.
+### Returns
 
-```python
-@durable
-def book_trip(ctx, dest, amount):
-    charge = ctx.step("charge", lambda: pay(amount), undo=lambda: refund(amount))
-    seat   = ctx.step("reserve", lambda: hold(dest))
-    return seat
-```
+The step's result — freshly computed on first run, or the JSON-deserialised
+cached value on replay.
+
+### Raises
+
+Re-raises whatever exception `fn` raises, after running the saga unwind for any
+completed steps. The exception is not wrapped.
+
+---
 
 ## Attributes
 
-<ResponseField name="run_id" type="str">
-  The idempotency key for this run.
+<ResponseField name="ctx.run_id" type="str">
+  The idempotency key for this run — a 12-character SHA-256 prefix derived from
+  the function name and its inputs. Stable across crashes. Use it for logging
+  and correlation.
+
+  ```python
+  @durable
+  def workflow(ctx, order_id: str):
+      print(f"run_id={ctx.run_id}")   # e.g. "a1b2c3d4e5f6"
+  ```
 </ResponseField>
 
-<ResponseField name="events" type="list[tuple[str, str]]">
+<ResponseField name="ctx.events" type="list[tuple[str, str]]">
   Ordered observability trail of what happened this invocation. Each entry is
-  `(step_name, status)` where status is one of `"executed"`, `"skipped"`,
-  `"rolled_back"`, or `"undo_failed"`. Great for tests and demos.
+  `(step_name, event)` where event is one of:
+
+  | Event | Meaning |
+  |-------|---------|
+  | `"executed"` | `fn` ran and the result was committed |
+  | `"skipped"` | result was replayed from the log — `fn` not called |
+  | `"rolled_back"` | `undo` fired during saga unwind |
+  | `"undo_failed"` | `undo` raised — recorded but unwind continued |
+
+  ```python
+  book_trip("Tokyo", 412)
+
+  for name, event in book_trip.last_context.events:
+      mark = "↺ skip" if event == "skipped" else "▸ exec"
+      print(f"  {mark}  {name}")
+  ```
+
+  ```
+    ▸ exec  charge_card
+    ↺ skip  book_flight   # was committed in a prior run
+    ↺ skip  update_crm
+  ```
 </ResponseField>
 
-<ResponseField name="rolled_back" type="list[str]">
-  Names of steps whose `undo` fired during a saga unwind.
+<ResponseField name="ctx.rolled_back" type="list[str]">
+  Names of steps whose `undo` successfully fired during a saga unwind this
+  invocation. Empty if no rollback occurred.
+
+  ```python
+  with pytest.raises(RuntimeError):
+      book_trip("Tokyo", 412)
+
+  assert "charge_card" in book_trip.last_context.rolled_back
+  ```
 </ResponseField>
+
+---
 
 ## Behaviour notes
 
-- **Commit-before-continue.** A step's result is written to the WAL *before*
-  the next line of your function runs, so a crash can never lose a committed
-  step.
-- **Replayed steps still register their undo.** A step skipped on resume is
-  still pushed onto the saga stack, so a later failure correctly rolls it back.
-- **Best-effort unwind.** If an `undo` itself raises, dura records
-  `undo_failed` and continues unwinding the remaining steps.
+**Commit-before-continue.** A step's result is written to the WAL *before* the
+next line of your function executes. A crash can never lose a committed step.
+
+**Replayed steps still register their undo.** A step skipped on resume (because
+it was committed in a prior process) is still pushed onto the saga stack. If a
+later step fails, the replayed step's `undo` fires correctly.
+
+**Step results must be JSON-serialisable.** The WAL stores results as JSON.
+Non-serialisable return values (custom objects, file handles, etc.) will raise
+a `TypeError` at commit time. If you need to pass a non-serialisable value
+between steps, have `fn` return a serialisable handle (an ID, a path) and
+reconstruct the object in the next step.
+
+**Best-effort unwind.** If an `undo` raises, dura records `"undo_failed"` in
+`ctx.events`, and continues unwinding remaining steps. Partial rollback is
+better than a stuck unwind.

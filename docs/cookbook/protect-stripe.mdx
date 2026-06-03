@@ -3,16 +3,39 @@ title: Protect a Stripe charge
 description: Never double-charge a customer, even if the process dies mid-checkout.
 ---
 
-The classic exactly-once case: charge a card, then do more work that might
-crash. Without durability, a retry charges again.
+The classic exactly-once problem: charge a card, then fulfil the order. Without
+durability, a crash between those two steps restarts the job and charges again.
+
+---
+
+## The vulnerable pattern
+
+```python
+def checkout(customer_id, amount_cents):
+    charge = stripe.PaymentIntent.create(
+        amount=amount_cents,
+        currency="usd",
+        customer=customer_id,
+        confirm=True,
+    )
+    # 💥 process dies here — OOM kill, deploy, timeout
+    warehouse.ship(customer_id)          # never runs
+    email.send_receipt(customer_id)      # never runs
+```
+
+Retry the job → Stripe charges again → customer is billed twice.
+
+---
+
+## The dura pattern
 
 ```python
 import stripe
 from dura import durable
 
 @durable
-def checkout(ctx, customer_id, amount_cents):
-    # 1. The dangerous step. If we crash AFTER this, we must not repeat it.
+def checkout(ctx, customer_id: str, amount_cents: int, order_id: str):
+    # Step 1 — the dangerous one. If this commits and we crash, it must not fire again.
     charge = ctx.step(
         "charge",
         lambda: stripe.PaymentIntent.create(
@@ -20,26 +43,71 @@ def checkout(ctx, customer_id, amount_cents):
             currency="usd",
             customer=customer_id,
             confirm=True,
+            idempotency_key=f"charge-{order_id}",  # belt and suspenders
         ),
+        # If a later step fails, issue the refund automatically.
         undo=lambda: stripe.Refund.create(payment_intent=charge["id"]),
     )
 
-    # 2. Crash here on a deploy? Resume skips the charge and starts fulfilment.
-    ctx.step("fulfil_order", lambda: warehouse.ship(customer_id))
-    ctx.step("send_receipt", lambda: email.receipt(customer_id, charge["id"]))
+    # Step 2 — crash here on a deploy? Resume skips charge and runs fulfilment.
+    ctx.step("fulfil", lambda: warehouse.ship(customer_id, order_id))
+
+    # Step 3 — send receipt only after fulfilment confirms.
+    ctx.step("receipt", lambda: email.send_receipt(customer_id, charge["id"]))
 
     return charge["id"]
 ```
 
 ### What you get
 
-- **Crash after `charge`** → restart resumes at `fulfil_order`. The card is
-  **not** charged again.
-- **`fulfil_order` fails** (out of stock) → `charge`'s `undo` fires a Stripe
-  refund automatically. No orphaned money.
+| Scenario | Without dura | With dura |
+|----------|-------------|-----------|
+| Crash after `charge` | Second run charges again | `charge` replayed from log — skipped |
+| `fulfil` fails (out of stock) | Orphaned charge stays open | `charge.undo` fires a Stripe refund |
+| `receipt` fails (email bounce) | Charge and fulfilment done; receipt lost | Retry — `charge` and `fulfil` skipped, `receipt` retried |
 
-<Note>
-Use the same `customer_id` and `amount_cents` on retry so dura derives the same
-run ID and resumes the existing run. For multiple distinct checkouts, pass an
-explicit `log=` per order or include an order ID in the inputs.
-</Note>
+---
+
+## Call it
+
+```python
+# First call — all steps execute.
+charge_id = checkout("cus_abc", 41200, "order_999", log="orders/order_999.db")
+
+# Process crashes and job is retried with the same arguments:
+charge_id = checkout("cus_abc", 41200, "order_999", log="orders/order_999.db")
+# ↑ charge is SKIPPED — already in the log.
+```
+
+### Isolating runs per order
+
+Use a per-order log path (or pass `run_id=`) so independent orders don't share
+a WAL. The example above uses `log="orders/order_999.db"`. The run ID is then
+derived from the function name + arguments, which will be unique per
+`(customer_id, order_id)` pair in practice.
+
+---
+
+## Inspect the log
+
+```bash
+sqlite3 orders/order_999.db "SELECT step_name, status FROM steps;"
+```
+
+```
+charge   done
+fulfil   done
+receipt  done
+```
+
+---
+
+## What about Stripe's idempotency key?
+
+Stripe's own idempotency key (`idempotency_key=`) protects against duplicate
+API calls at the Stripe layer — if you send the same key twice, Stripe returns
+the same result. That's a good belt to wear.
+
+dura is the suspenders: it prevents the function from reaching the Stripe call
+at all on replay. The two complement each other — neither alone is sufficient
+for an end-to-end exactly-once guarantee across your whole checkout flow.

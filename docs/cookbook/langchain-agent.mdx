@@ -1,50 +1,169 @@
 ---
 title: Wrap a LangChain agent
-description: Add durability to a tool-calling agent loop without rewriting it.
+description: Add crash-proof durability to any LangChain tool-calling loop with one decorator.
 ---
 
-dura is framework-agnostic — it wraps plain Python functions, so it drops into
-a LangChain (or LlamaIndex, or raw OpenAI) agent loop with one decorator.
+LangChain agents fail mid-loop constantly — rate limits, tool timeouts, bad API
+responses. On retry, a naive loop re-runs **every tool call from the beginning**,
+including the one that already sent the email or moved the money.
 
-The trick: make each **tool invocation** a `ctx.step`. The LLM call that
-*decides* the next action can re-run cheaply, but the tool's side effect is
-committed exactly once.
+dura solves this by making each tool invocation a committed step. On retry, the
+completed tool calls are skipped and the agent picks up exactly where it died.
+
+---
+
+## The production example
+
+This is the agent in `examples/research_agent.py` — a real workflow using
+DuckDuckGo web search and Claude Haiku summarisation, with every step committed
+to a WAL.
 
 ```python
-from dura import durable
-from langchain.agents import AgentExecutor
+import os
+from pathlib import Path
+from datetime import datetime
 
+from dura import durable
+from langchain_anthropic import ChatAnthropic
+from langchain_community.tools import DuckDuckGoSearchRun
+
+llm = ChatAnthropic(model="claude-haiku-4-5-20251001", api_key=os.environ["ANTHROPIC_API_KEY"])
+search = DuckDuckGoSearchRun()
+
+
+def web_search(query: str) -> str:
+    return search.run(query)
+
+
+def summarise(topic: str, raw: str) -> str:
+    prompt = (
+        f"Given raw search results about '{topic}', "
+        f"write a concise 2-3 sentence summary.\n\n{raw[:3000]}"
+    )
+    return llm.invoke(prompt).content
+
+
+@durable
+def research_agent(ctx, topic: str, queries: list[str]):
+    sections = []
+
+    for i, query in enumerate(queries, 1):
+        # Both the web search AND the LLM call are in one step.
+        # If we crash mid-summary, neither the search nor the LLM fires again on resume.
+        result = ctx.step(
+            f"search_{i}",
+            lambda q=query: {
+                "query": q,
+                "summary": summarise(q, web_search(q)),
+            },
+        )
+        sections.append(result)
+
+    # Final write — also exactly-once.
+    report_path = ctx.step("write_report", lambda: write_report(topic, sections))
+    return report_path
+```
+
+### Run it
+
+```bash
+pip install dura langchain-anthropic langchain-community ddgs
+export ANTHROPIC_API_KEY=sk-ant-...
+
+python examples/research_agent.py "durable execution for AI agents"
+```
+
+**First run output:**
+
+```
+  log: research_durable_execution_for_ai_agent.db
+
+  [1/3] what is durable execution for AI agents
+         ✓ done
+  [2/3] durable execution for AI agents use cases and examples
+         ✓ done
+  [3/3] durable execution for AI agents tools and frameworks 2024
+         ✓ done
+
+report written → report_durable_execution_for_ai_agent.md
+steps this run:
+  ▸ exec  search_1
+  ▸ exec  search_2
+  ▸ exec  search_3
+  ▸ exec  write_report
+```
+
+**Interrupt with Ctrl+C after step 1. Rerun:**
+
+```
+  [1/3] what is durable execution for AI agents
+         ↺ skipped (from log)
+  [2/3] durable execution for AI agents use cases and examples
+         ✓ done
+  ...
+```
+
+The first search is not repeated. No duplicate API calls, no duplicate costs.
+
+---
+
+## The key insight: what to wrap as a step
+
+The LLM call that *decides* the next action can usually re-run cheaply and
+without consequence. The tool's side effect is the dangerous part.
+
+```python
 @durable
 def run_agent(ctx, task: str):
     state = {"task": task, "history": []}
 
     for i in range(MAX_STEPS):
-        # Deciding the next action is a pure-ish LLM call; name it per turn.
-        action = ctx.step(
-            f"decide_{i}",
-            lambda: agent.plan(state),
-        )
+        # Replanning is cheap. You can re-run it on resume.
+        # But wrapping it still means you don't re-run earlier turns.
+        action = ctx.step(f"plan_{i}", lambda: agent.plan(state))
+
         if action.is_finish:
             return action.output
 
-        # The TOOL is the side effect. Committed exactly once.
+        # The tool call is the side effect. Committed exactly once.
         result = ctx.step(
             f"tool_{i}_{action.tool}",
             lambda: action.run(),
-            undo=lambda: action.compensate() if action.reversible else None,
         )
         state["history"].append((action, result))
 ```
 
-### Why this matters for agents
-
-Agents fail mid-loop constantly — a rate limit, a timeout, a bad tool response
-that crashes the runner. On retry, a naive loop re-runs **every tool call so
-far**, including the one that already sent the email or moved the money. With
-dura, the committed tool calls are skipped and the agent picks up exactly where
-it died.
-
 <Tip>
-Give each turn's steps a unique name (`tool_{i}_...`). The step name plus the
-run ID is the idempotency key, so distinct turns must have distinct names.
+Give each turn's steps a unique name that includes the turn index
+(`plan_0`, `tool_0_web_search`, `plan_1`, `tool_1_email_send`, ...). The step
+name + run ID is the idempotency key, so distinct turns must have distinct names.
+Without the index, step 3's `tool_web_search` would collide with step 1's
+`tool_web_search` and return the wrong cached result.
 </Tip>
+
+---
+
+## Stable log path for crash-resume
+
+The run ID is derived from your function arguments. For the research agent,
+both the topic and the queries list are arguments — so rerunning with the same
+topic gives the same run ID and resumes the same WAL:
+
+```python
+slug = topic.lower().replace(" ", "_")[:40]
+log  = f"research_{slug}.db"
+
+report = research_agent(topic, queries, log=log)
+```
+
+Delete the `.db` file to start fresh. Keep it to resume after a crash.
+
+---
+
+## Dependencies
+
+```bash
+pip install dura langchain-anthropic "langchain-community>=0.2" ddgs
+```
+
+dura itself has zero dependencies. The others are for the agent example only.

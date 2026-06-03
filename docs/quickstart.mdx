@@ -9,77 +9,149 @@ description: Make any agent action exactly-once and crash-proof in two minutes.
 pip install dura
 ```
 
-Zero dependencies. Python 3.9+.
+Zero external dependencies. Python 3.9+. The only storage is SQLite, which
+ships with Python itself.
 
-## Wrap your agent
+---
+
+## The problem in one line
+
+```python
+charge_card()   # ← Stripe committed
+# process dies
+book_flight()   # ← never runs. charge never rolls back.
+```
+
+The customer is billed. The flight is never booked. You find out from support.
+
+---
+
+## The fix: two lines of code
 
 ```python
 from dura import durable
 
 @durable
 def book_trip(ctx, dest, amount):
-    # Step 1 — charge the card. If we crash after this, it won't fire again.
-    charge = ctx.step(
-        "charge_card",
-        lambda: charge_card(amount),
-        undo=lambda: refund_card(charge["id"]),  # auto-refund if later step fails
-    )
-
-    # Step 2 — if this fails, charge_card is automatically refunded.
-    flight = ctx.step("book_flight", lambda: book_flight(dest))
-
-    # Step 3 — safe to retry; only runs if both above succeeded.
-    ctx.step("update_crm", lambda: update_crm(flight))
-
+    charge = ctx.step("charge_card", lambda: charge_card(amount))
+    flight  = ctx.step("book_flight", lambda: book_flight(dest))
+    ctx.step("update_crm",   lambda: update_crm(flight))
     return flight
 ```
 
-That's the entire API. Every `ctx.step` is:
+That's it. Every `ctx.step` is automatically:
 
-- **Exactly-once** — if the process crashes and restarts, completed steps are skipped.
-- **Rollback-able** — if a later step fails, completed steps undo in reverse order.
-- **Durable** — the return value is committed to a write-ahead log before the workflow continues.
+- **Exactly-once** — the result is committed to a write-ahead log before the next line runs. A crash and restart skips completed steps.
+- **Resumable** — calling the function again with the same arguments picks up where it died.
+- **Rollback-able** — add `undo=` to any step; if a later step fails, dura unwinds completed steps in reverse order.
 
-## Run it
+---
+
+## See it survive a crash
+
+### Step 1 — run until the crash point
 
 ```python
-# First run — all three steps execute.
-book_trip("Tokyo", 412)
-
-# Process crashes here. Restart with the same arguments:
-book_trip("Tokyo", 412)
-# ↑ charge_card is SKIPPED — already committed to the log.
+book_trip("Tokyo", 412, crash_after="charge_card")
+# SimulatedCrash raised after the charge commits.
+# The card has been charged. The log has it recorded.
 ```
 
-dura derives a run ID from the function name and inputs (SHA-256), so re-calling
-with the same arguments automatically resumes from the last checkpoint. No
-explicit run ID or infrastructure changes needed.
+### Step 2 — restart with the same arguments
 
-## Verify it works
+```python
+book_trip("Tokyo", 412)
+```
+
+**Output:**
+
+```
+[charge_card]  ↺ skipped — committed in prior run
+[book_flight]  ✓ executed
+[update_crm]   ✓ executed
+```
+
+The card is charged exactly once. The flight is booked. The customer is not double-billed.
+
+---
+
+## Run the demo yourself
 
 ```bash
-pip install dura
-python -m pytest -q    # 17 passing, 0 xfail
+python examples/book_trip.py crash   # crashes after charging
+python examples/book_trip.py         # resumes — charge is skipped
 ```
 
-Or run the crash/resume demo yourself:
+---
+
+## Add auto-rollback
+
+If a step can fail and you want to undo what came before it, pass `undo=`:
+
+```python
+@durable
+def book_trip(ctx, dest, amount):
+    charge = ctx.step(
+        "charge_card",
+        lambda: charge_card(amount),
+        undo=lambda: refund_card(charge["id"]),  # fires if a later step fails
+    )
+    # If book_flight raises — no seats, rate-limit, anything —
+    # dura automatically calls refund_card(). The customer is never out of pocket.
+    flight = ctx.step("book_flight", lambda: book_flight(dest))
+    ctx.step("update_crm", lambda: update_crm(flight))
+    return flight
+```
+
+---
+
+## Verify the guarantee
+
+The test suite includes a real SIGKILL test — not a caught exception, an actual
+`kill -9` mid-workflow — followed by a fresh process restart:
 
 ```bash
-python examples/book_trip.py crash   # crashes after charging the card
-python examples/book_trip.py         # restarts — charge is skipped
+python -m pytest -q
+# 17 passed in <2s
 ```
+
+```bash
+python -m pytest tests/test_integration.py::test_survives_a_real_sigkill_exactly_once -v
+# The side effect fires exactly once. Total: 1.
+```
+
+---
+
+## Check what's in the log
+
+After any run you can inspect the SQLite log directly:
+
+```bash
+sqlite3 dura.db "SELECT step_name, status, result_json FROM steps;"
+```
+
+```
+charge_card|done|{"id": "ch_1", "amount": 412}
+book_flight|done|{"id": "fl_1", "dest": "Tokyo"}
+update_crm |done|{"ok": true}
+```
+
+Each row is one committed step. A crash between rows means the next run starts
+from the last committed row.
+
+---
 
 <CardGroup cols={2}>
   <Card title="How durable execution works" icon="bolt" href="/concepts/durable-execution">
-    The write-ahead log, replay, and exactly-once guarantees explained.
+    The write-ahead log, replay, and exactly-once guarantees explained in depth.
   </Card>
   <Card title="Saga rollback" icon="rotate-left" href="/concepts/saga-rollback">
     How compensating actions unwind partial workflows on failure.
   </Card>
   <Card title="Protect a Stripe charge" icon="credit-card" href="/cookbook/protect-stripe">
-    Never double-charge a customer, even across crashes.
+    Full production pattern: never double-charge a customer, even across crashes.
   </Card>
   <Card title="Wrap a LangChain agent" icon="robot" href="/cookbook/langchain-agent">
-    Add durability to any LangChain tool-calling loop.
+    Add durability to any LangChain tool-calling loop in one decorator.
   </Card>
 </CardGroup>

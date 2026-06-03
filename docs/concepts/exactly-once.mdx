@@ -1,64 +1,132 @@
 ---
 title: Exactly-once
-description: How dura guarantees a step's side effect fires once, even across crashes and retries.
+description: How dura guarantees a step's side effect fires once — across crashes, retries, and concurrent workers.
 ---
 
 ## At-least-once is not enough
 
 Most retry systems give you **at-least-once**: if something might have failed,
-run it again. That's fine for idempotent reads. It's a disaster for a card
-charge, an email, or a booking — the action can fire twice.
+run it again. That's safe for idempotent reads. It's a disaster for a card
+charge, an email send, or a booking — the action can fire twice.
 
-dura gives you **exactly-once** for the steps you wrap.
+Idempotency keys (on the API side) help, but they only protect against
+*your* retries. They can't protect against a process that restarts and
+re-runs the entire function from the top.
 
-## How
+dura gives you **exactly-once for the functions you wrap** — the side effect
+fires once no matter how many times the process crashes and restarts.
 
-Each run has a deterministic **run ID**, derived from the function name plus
-its inputs (a SHA-256 prefix). Within a run, each step has a name. The pair
-`(run_id, step_name)` is the idempotency key.
+---
 
-- Before executing a step, dura looks up that key in the log.
-- If it's present, the committed result is returned and `fn` never runs.
-- If it's absent, `fn` runs, the result is committed, then returned.
+## How the guarantee works
+
+### The idempotency key
+
+Each run has a deterministic **run ID** derived from the function name plus its
+inputs (SHA-256 prefix). Within a run, each step has a name you provide. The
+pair `(run_id, step_name)` is the idempotency key.
+
+```python
+# These two calls get the same run_id and resume the same run:
+book_trip("Tokyo", 412)   # run_id: "a1b2c3d4e5f6"
+book_trip("Tokyo", 412)   # crash-restart → same id → resumes from WAL
+
+# Different inputs → different run_id → fresh run:
+book_trip("Nairobi", 412)  # run_id: "7g8h9i0j1k2l"
+```
+
+### Before executing a step, dura looks up the key
+
+1. **Key found, status `done`** → return the committed result. `fn` never runs.
+2. **Key not found** → acquire a claim (see below), run `fn`, commit the result, return it.
 
 ```python
 @durable
 def flow(ctx):
     return ctx.step("compute", lambda: expensive_call())
 
-flow(log="run.db")   # executes expensive_call(), commits the result
-flow(log="run.db")   # returns the SAME result from the log — no second call
+flow(log="run.db")   # runs expensive_call(), commits result
+flow(log="run.db")   # returns cached result — expensive_call NOT called
 ```
 
-## The `MISSING` sentinel
+### The `MISSING` sentinel
 
 A step can legitimately return `None`. To distinguish "committed `None`" from
-"never committed," the WAL uses a `MISSING` sentinel internally rather than
-treating `None` as absent. A step that returned `None` is still skipped on replay.
+"never committed", the WAL uses a `MISSING` sentinel internally. A step that
+returned `None` is still recognised as completed and skipped on replay.
+
+---
 
 ## Concurrency: the single-writer claim
 
-Exactly-once has to hold even when **two workers race the same run** — say, two
-replicas of your service both pick up the same job. dura handles this with a
-lease-based claim.
+Exactly-once must hold even when **two workers race the same run** — two
+replicas of your service both picking up the same job, for example.
 
-Before executing a step, a worker must `claim` it: under a SQLite write lock,
-it writes a short-lived lease (`worker_id` + expiry) into the WAL. The write
-lock serializes claims, so exactly one worker comes away owning the step. The
-others see the claim, wait, and read the committed result once it lands —
-they never run the side effect.
+dura handles this with a **lease-based claim**. Before executing a step, a
+worker must acquire a claim: under a SQLite `BEGIN IMMEDIATE` write lock, it
+inserts a short-lived lease (`worker_id` + expiry timestamp) into the WAL. The
+write lock serializes claims, so exactly one worker comes away owning the step.
 
-```text
-Worker A:  claim charge → ACQUIRED → runs charge → commits
-Worker B:  claim charge → HELD → waits → claim → DONE → reads cached result
 ```
+Worker A:  claim "charge" → ACQUIRED → runs charge_card() → commits result
+Worker B:  claim "charge" → HELD     → waits 50ms
+Worker B:  claim "charge" → DONE     → reads cached result, returns it
+```
+
+Both workers return the same committed result. `charge_card` fired once.
 
 ### Surviving a worker that dies mid-step
 
-A lease has an expiry. If the worker holding a claim dies *while executing*
-(before it commits), the lease eventually expires and another worker steals it
-and runs the step. So crash-and-resume still works even when the crash happens
-in the middle of a step, not just between steps.
+A lease has an expiry (30 seconds by default). If the worker holding a claim
+dies *while executing* — before it commits — the lease eventually expires and
+another worker steals it:
 
-This is verified in the test suite by two workers racing the same step
-(exactly-once) and by a stale-lease takeover test.
+```
+Worker A:  claim "charge" → ACQUIRED → starts charge_card() → killed
+Worker B:  claim "charge" → HELD     → waits
+           (lease expires after 30s)
+Worker B:  claim "charge" → ACQUIRED → runs charge_card() → commits
+```
+
+The step executes exactly once — either Worker A commits and Worker B reads the
+cache, or Worker A dies and Worker B takes over.
+
+<Note>
+The 30-second lease means a dead worker's step can stay blocked for up to 30s
+before another worker takes over. For short-lived steps this is fine. For
+steps that take many minutes, pass `lease=` to `ctx.step()` (not yet exposed in
+the public API — use `run_id`-based sharding instead).
+</Note>
+
+---
+
+## Verification
+
+### Unit test: two threads race the same step
+
+```bash
+python -m pytest tests/test_integration.py::test_concurrent_workers_execute_a_step_exactly_once -v
+```
+
+Two threads call the same `@durable` function simultaneously against the same
+log. The test asserts the side effect (incrementing a counter file) happened
+exactly once and both threads received the same result.
+
+### Unit test: stale claim is taken over
+
+```bash
+python -m pytest tests/test_integration.py::test_a_stale_claim_is_taken_over_after_the_lease_expires -v
+```
+
+A claim is inserted with a 100ms expiry. After 150ms, a second worker claims
+the same step, acquires it (`ACQUIRED`), and executes.
+
+### Integration test: real SIGKILL
+
+```bash
+python -m pytest tests/test_integration.py::test_survives_a_real_sigkill_exactly_once -v
+```
+
+A subprocess is killed with `SIGKILL` immediately after committing the first
+step. A new subprocess restarts. The test checks the side-effect file:
+the action appears exactly once.

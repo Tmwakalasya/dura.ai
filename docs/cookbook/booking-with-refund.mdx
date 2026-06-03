@@ -1,52 +1,146 @@
 ---
 title: Booking with refund
-description: A full booking saga — charge, reserve, confirm — that unwinds cleanly on failure.
+description: A full booking saga — charge, reserve, confirm — that unwinds cleanly on any failure.
 ---
 
-This is the end-to-end saga behind the `side_by_side.py` demo. Three steps with
-side effects, each with a compensating action, so any failure leaves the system
-in a clean state.
+This is the end-to-end saga behind `examples/side_by_side.py`. Three steps,
+each with a side effect and a compensating action, so any failure at any point
+leaves the system in a clean state.
+
+---
+
+## The code
 
 ```python
 from dura import durable
 
 @durable
-def book_trip(ctx, dest, amount):
-    ctx.step(
+def book_trip(ctx, dest: str, amount: int):
+    # Step 1: charge the card. Undo = refund.
+    charge = ctx.step(
         "charge_card",
         lambda: payments.charge(amount),
-        undo=lambda: payments.refund(amount),
+        undo=lambda: payments.refund(charge["id"]),
     )
+
+    # Step 2: reserve the seat. Undo = release the hold.
     seat = ctx.step(
         "reserve_seat",
         lambda: inventory.reserve(dest),
-        undo=lambda: inventory.release(dest),
+        undo=lambda: inventory.release(seat["hold_id"]),
     )
-    ctx.step(
+
+    # Step 3: confirm the booking. Undo = cancel.
+    booking = ctx.step(
         "confirm_booking",
-        lambda: bookings.confirm(seat),
-        undo=lambda: bookings.cancel(seat),
+        lambda: bookings.confirm(seat["hold_id"], charge["id"]),
+        undo=lambda: bookings.cancel(booking["id"]),
     )
+
+    return booking
 ```
 
-### Failure scenarios
+---
 
-| Fails at | Completed before it | Unwind order |
-|----------|--------------------|--------------|
-| `reserve_seat` | `charge_card` | refund |
-| `confirm_booking` | `charge_card`, `reserve_seat` | release seat → refund |
+## Failure scenarios
 
-The unwind always runs in **reverse commit order**, so dependencies undo
-safely. The failing step's own `undo` never fires because its side effect never
-succeeded.
+### `reserve_seat` fails (no availability)
 
-### Try it
+```
+charge_card    ✓ executed  ($412 charged)
+reserve_seat   ✗ failed    (no seats on this flight)
+  → unwind:
+    charge_card.undo()    ($412 refunded)
+```
+
+Customer is made whole. No orphaned charge.
+
+### `confirm_booking` fails (booking system down)
+
+```
+charge_card      ✓ executed  ($412 charged)
+reserve_seat     ✓ executed  (seat held)
+confirm_booking  ✗ failed    (API timeout)
+  → unwind (reverse order):
+    reserve_seat.undo()    (seat hold released)
+    charge_card.undo()     ($412 refunded)
+```
+
+Seat released. Charge refunded. System back to initial state.
+
+### Process crashes after `charge_card` commits
+
+```
+charge_card    ✓ committed to WAL
+# crash
+
+# restart with same arguments:
+charge_card    ↺ skipped (reads from WAL — not charged again)
+reserve_seat   ✓ executed
+confirm_booking ✓ executed
+```
+
+Crash-resume and saga rollback compose. A step replayed from the log still
+registers its `undo`, so if `confirm_booking` later fails, the refund fires
+even though the charge was committed in a prior process.
+
+---
+
+## Full failure table
+
+| Fails at | Steps completed | Unwind order |
+|----------|-----------------|--------------|
+| `charge_card` | none | (nothing to undo) |
+| `reserve_seat` | `charge_card` | refund charge |
+| `confirm_booking` | `charge_card`, `reserve_seat` | cancel booking → release seat → refund charge |
+
+---
+
+## Run the side-by-side demo
 
 ```bash
 python examples/side_by_side.py
 ```
 
-```text
-WITHOUT dura:  customer out $412, no flight       ❌ orphaned charge
-WITH dura:     balance held $0, auto-refunded      ✅ clean
+```
+WITHOUT dura  ─────────────────────────────────────────
+  charge_card()    $412 charged
+  reserve_seat()   no seats — raised
+  [exited]
+
+  customer balance: -$412       ← orphaned charge
+  seat held:          no
+
+WITH dura  ─────────────────────────────────────────────
+  charge_card    ✓ executed
+  reserve_seat   ✗ failed — rolling back
+  charge_card    ↩ refunded
+
+  customer balance: $0          ← clean
+  seat held:        no
+```
+
+---
+
+## Inspecting events in tests
+
+```python
+import pytest
+from dura import durable
+
+def test_refund_fires_on_reserve_failure():
+    @durable
+    def workflow(ctx):
+        charge = ctx.step("charge", lambda: {"id": "ch_1"}, undo=lambda: None)
+        ctx.step("reserve", lambda: (_ for _ in ()).throw(RuntimeError("no seats")))
+
+    with pytest.raises(RuntimeError, match="no seats"):
+        workflow()
+
+    assert "charge" in workflow.last_context.rolled_back
+    assert workflow.last_context.events == [
+        ("charge",  "executed"),
+        ("reserve", "executed"),      # raised
+        ("charge",  "rolled_back"),
+    ]
 ```
