@@ -3,44 +3,56 @@ title: Durable execution
 description: How dura makes any workflow crash-proof using a write-ahead log.
 ---
 
-## The problem
+## The dangerous window
 
-Every agent that touches the outside world has a window where it can lose state:
+Every process that calls external APIs has a window where it can lose state:
 
 ```
-charge_card()   ← side effect committed to Stripe
-# 💥 process dies here — OOM kill, deploy, crashed container
-book_flight()   ← never runs
+charge_card()      ← side effect committed to Stripe ($412 charged)
+# 💥 OOM kill, deploy restart, pod evicted — process is gone
+book_flight()      ← never runs
 ```
 
 On restart, the agent has no memory of the charge. It charges again. The
-customer is billed twice, the flight is still not booked, and you find out
-via a support ticket.
+customer is billed twice. The flight is still not booked.
 
-This isn't a bug in your code. It's a fundamental problem with any stateful
+This isn't a bug in your code. It's a fundamental property of any stateful
 process that can die between steps. The dangerous work already happened — the
-danger is that retrying it repeats that work.
+danger is that retrying repeats it.
+
+The fix is not catching exceptions. A `kill -9` doesn't raise. A docker restart
+doesn't raise. An OOM kill doesn't raise. You need the result committed to
+durable storage *before* the process continues — so that a restart can read it
+back and skip the step.
+
+That's what dura does.
+
+---
 
 ## The mechanism: write-ahead log
 
 dura records the result of each step to a **write-ahead log (WAL)** *before*
-the workflow is allowed to continue.
+the workflow is allowed to continue. The log is a local SQLite file — zero
+external dependencies.
 
-The contract is simple:
+The contract for every `ctx.step("name", fn)`:
 
-1. `ctx.step("charge_card", fn)` is called.
-2. dura checks the log: is `charge_card` already committed for this run?
-3. **Yes** → return the cached result. `fn` is never called.
-4. **No** → call `fn`, commit the result, return it.
+1. Look up `(run_id, "name")` in the log.
+2. **Found** → return the committed result. `fn` is never called.
+3. **Not found** → call `fn`, commit the result to the log, return it.
 
-Because the commit happens before the next line of your function runs, there is
-no window where a step ran but wasn't recorded. A crash either:
-- Happens **before the commit** → the step replays on next restart (correct, nothing was recorded).
-- Happens **after the commit** → the step is skipped on next restart (correct, result is in the log).
+Because the commit happens before the next line of your function executes,
+there is no window where a step ran but wasn't recorded.
+
+A crash either:
+- Happens **before the commit** → the step replays on next restart. Correct: nothing was recorded.
+- Happens **after the commit** → the step is skipped on next restart. Correct: result is in the log.
 
 **Either way: exactly-once.**
 
-## How replay works
+---
+
+## Replay in detail
 
 ```python
 @durable
@@ -50,56 +62,85 @@ def book_trip(ctx, dest, amount):
     ctx.step("update_crm", lambda: update_crm(flight))
 ```
 
-**First run** — all three steps execute and results are committed:
+### First run — all three steps execute
 
 ```
-WAL: { charge_card: {"id": "ch_1", "amount": 412},
-       book_flight: {"id": "fl_1"},
-       update_crm:  {"ok": true} }
+WAL after run:
+  charge_card  →  {"id": "ch_1", "amount": 412}   status: done
+  book_flight  →  {"id": "fl_1", "dest": "Tokyo"}  status: done
+  update_crm   →  {"ok": true}                     status: done
 ```
 
-**Process crashes after `charge_card`:**
+### Process crashes immediately after `charge_card` commits
 
 ```
-WAL: { charge_card: {"id": "ch_1", "amount": 412} }
+WAL at time of crash:
+  charge_card  →  {"id": "ch_1", "amount": 412}   status: done
+  (book_flight and update_crm never started)
 ```
 
-**Restart with the same arguments** — dura reads the WAL before each step:
+### Restart with the same arguments
 
-| Step | WAL has result? | Action |
-|------|-----------------|--------|
-| `charge_card` | ✓ yes | Return cached — `fn` is **not called** |
-| `book_flight` | ✗ no | Execute `fn`, commit result, return it |
-| `update_crm` | ✗ no | Execute `fn`, commit result, return it |
+dura re-runs the function body from the top. Before each step it checks the log:
+
+| Step | In log? | What happens |
+|------|---------|--------------|
+| `charge_card` | ✓ yes | Returns cached result — `fn` **not called** |
+| `book_flight` | ✗ no | Executes `fn`, commits result, returns it |
+| `update_crm` | ✗ no | Executes `fn`, commits result, returns it |
 
 The charge fires exactly once. The customer is never double-billed.
 
+---
+
 ## The run ID
 
-dura needs to know *which* WAL entry to read on resume. It derives a
-deterministic **run ID** from the function name and its inputs using SHA-256:
+dura needs to match a restart to the right WAL entries. It derives a
+deterministic **run ID** from the function name and its inputs via SHA-256:
 
 ```python
-run_id = sha256(f"{fn.__name__}:{json(args)}:{json(kwargs)}")[:12]
+run_id = sha256(f"{fn.__name__}:{json.dumps(args)}:{json.dumps(kwargs)}")[:12]
 ```
 
-This means re-calling with the same arguments automatically resumes the same
-run — no explicit ID needed, no infrastructure changes required.
+Calling with the same arguments automatically resumes the same run. No explicit
+ID, no infrastructure changes.
 
 ```python
-book_trip("Tokyo", 412)  # run_id: "a1b2c3d4e5f6"
-# crash...
-book_trip("Tokyo", 412)  # same inputs → same run_id → resumes from WAL
-book_trip("Tokyo", 999)  # different inputs → new run_id → fresh run
+book_trip("Tokyo", 412)   # run_id: "a1b2c3d4e5f6"
+# crash …
+book_trip("Tokyo", 412)   # same inputs → same run_id → resumes from WAL
+book_trip("Nairobi", 412) # different inputs → new run_id → fresh run
 ```
 
-For workflows where the same logical "run" can be triggered with slightly
-different arguments (e.g. a retry wrapper that adds a timestamp), pass a stable
-`run_id` explicitly:
+When the same logical run might be triggered with slightly different arguments
+(a retry wrapper that appends a timestamp, for example), pass a stable ID
+explicitly:
 
 ```python
 book_trip("Tokyo", 412, run_id="order_42")
 ```
+
+---
+
+## What's in the log
+
+After any run, inspect the SQLite file directly:
+
+```bash
+sqlite3 dura.db "SELECT run_id, step_name, status, result_json FROM steps;"
+```
+
+```
+a1b2c3d4e5f6  charge_card  done  {"id": "ch_1", "amount": 412}
+a1b2c3d4e5f6  book_flight  done  {"id": "fl_1"}
+a1b2c3d4e5f6  update_crm   done  {"ok": true}
+```
+
+Each row is one committed step. The `result_json` column is what gets returned
+on replay. You can read, back up, or move this file like any other SQLite
+database.
+
+---
 
 ## Storage
 
@@ -109,14 +150,15 @@ By default dura writes to `dura.db` in the current directory. Override it:
 # per-call
 book_trip("Tokyo", 412, log="orders/order_42.db")
 
-# per-decorator
+# per-decorator (applies to every call)
 @durable(log="/var/dura/workflows.db")
 def book_trip(ctx, dest, amount): ...
 ```
 
 For multiple workers sharing state, point them all at the same file on shared
-storage. dura uses SQLite's WAL journal mode and an IMMEDIATE write lock on
-claims, so concurrent workers are safe.
+storage. dura uses SQLite's WAL journal mode and a `BEGIN IMMEDIATE` write lock
+on step claims, so concurrent workers are safe — only one executes any given
+step, the others read the committed result.
 
 <Note>
 SQLite ships with Python's standard library — dura has **zero dependencies**.
@@ -124,15 +166,22 @@ For production multi-region deployments, dura Cloud (coming soon) replaces
 the local SQLite file with a replicated managed log.
 </Note>
 
-## Proving the guarantee
+---
 
-The test suite includes a real `SIGKILL` test — not a caught exception, an
-actual uncatchable process kill mid-workflow — followed by a fresh-process
+## The SIGKILL proof
+
+The test suite includes a real `kill -9` test — not a caught exception, an
+actual uncatchable process kill mid-workflow — followed by a fresh process
 restart:
 
 ```bash
 python -m pytest tests/test_integration.py::test_survives_a_real_sigkill_exactly_once -v
 ```
 
-The side effect file is checked: the charge appears exactly once before the
-kill, and exactly once after the restart. Total: 1. That's the guarantee.
+What the test does:
+1. Starts a subprocess running a workflow with a side effect (writes to a file).
+2. Sends `SIGKILL` immediately after the side effect step commits.
+3. Starts a new subprocess with the same arguments.
+4. Asserts the side effect file shows the action happened **exactly once**.
+
+Total: 1. That's the guarantee.

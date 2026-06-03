@@ -1,59 +1,132 @@
 ---
 title: Saga rollback
-description: When a step fails, completed steps undo in reverse order.
+description: When a step fails, completed steps undo in reverse order — automatically.
 ---
 
-## Partial failure is the hard case
+## The other failure mode
 
-Crash-and-resume handles the case where you want to *finish* the workflow. But
-sometimes a workflow can't finish — the flight has no seats after you've
-already charged the card. You don't want to retry forever; you want to **undo
-what you did** and bail out cleanly.
+Crash-and-resume handles the case where you want to *finish* the workflow.
+But some failures aren't crashes — the flight has no seats, the API returns an
+error, the inventory is out of stock. You don't want to retry; you want to
+**undo what already happened** and surface a clean error.
 
-This is the [saga pattern](https://microservices.io/patterns/data/saga.html):
-every step that has a side effect also has a **compensating action** that
-reverses it.
+Without saga rollback:
+
+```
+charge_card()   ← $412 taken from the customer
+book_flight()   ← FAILS: no seats available
+# charge is never refunded. customer is out $412 for a trip that isn't booked.
+```
+
+With dura, you register a compensating action alongside each step. If anything
+goes wrong downstream, dura unwinds in reverse:
+
+```
+charge_card()   ← $412 charged
+book_flight()   ← FAILS: no seats
+  → undo: refund_card()   ← $412 returned. customer is made whole.
+```
+
+---
 
 ## The `undo=` argument
 
 ```python
 @durable
 def book_trip(ctx, dest, amount):
-    ctx.step("charge_card", lambda: charge(amount),
-             undo=lambda: refund(amount))          # compensating action
-    ctx.step("book_flight", lambda: book_flight(dest))   # 💥 no seats
+    charge = ctx.step(
+        "charge_card",
+        lambda: charge_card(amount),
+        undo=lambda: refund_card(charge["id"]),   # compensating action
+    )
+
+    # If this raises for any reason, charge_card's undo fires automatically.
+    seat = ctx.step(
+        "book_flight",
+        lambda: book_flight(dest),
+        undo=lambda: cancel_hold(seat["hold_id"]),
+    )
+
+    # Safe to skip undo= for idempotent or non-reversible steps.
+    ctx.step("send_confirmation", lambda: email.send(charge, seat))
 ```
 
-If `book_flight` raises, dura unwinds: it walks the completed steps **in
-reverse commit order** and calls each one's `undo`. So `charge_card`'s refund
-fires, the customer is made whole, and the original exception propagates so the
-caller knows the workflow failed.
+The `undo` lambda captures the step's result from the enclosing scope, so you
+always have access to the IDs and handles you need to reverse the operation.
 
-## Rules
+---
 
-- **Only completed steps roll back.** The step that *failed* never had its
-  side effect succeed, so its `undo` does not fire.
-- **Reverse order.** `a, b, c` completed → unwind runs `undo_c, undo_b, undo_a`.
-  This matters when later steps depend on earlier ones.
-- **No `undo`, no-op.** A step without a compensating action is simply skipped
-  during unwind — nothing to compensate.
-- **Resume-safe.** A step replayed from the log still registers its `undo`, so
-  a failure *after* resume rolls back steps that were committed in an earlier
-  process.
+## Unwind rules
 
-## Worked example
+**Only completed steps roll back.** The step that failed never had its side
+effect succeed, so its `undo` does not fire. Dura only compensates steps that
+actually ran.
 
-```text
-WITHOUT dura:  customer out $412, no flight       ❌ orphaned charge
-WITH dura:     balance held $0, auto-refunded      ✅ clean
+**Reverse commit order.** If steps `a`, `b`, `c` completed before `d` fails,
+the unwind runs `undo_c` → `undo_b` → `undo_a`. This matters when later steps
+depend on earlier ones — releasing a seat reservation before refunding the
+payment, for example.
+
+**No `undo`, no-op.** A step without a compensating action is skipped during
+unwind. Use this for idempotent operations or steps where "undo" doesn't make
+sense (sending a read-only notification, incrementing a counter).
+
+**Resume-safe.** A step replayed from the log (because it completed in a prior
+run) still registers its `undo` on the saga stack. So if a crash happens during
+step 3 and the process restarts, runs step 3 again, and then step 4 fails —
+dura correctly rolls back steps 1, 2, and 3, even though 1 and 2 were committed
+in a previous process.
+
+**Best-effort unwind.** If an `undo` itself raises, dura records `"undo_failed"`
+in `ctx.events` and continues unwinding the remaining steps. Partial rollback is
+better than no rollback.
+
+---
+
+## Failure scenario table
+
+For a three-step workflow — `charge_card`, `reserve_seat`, `confirm_booking`:
+
+| Fails at | What completed before it | Unwind order |
+|----------|--------------------------|--------------|
+| `charge_card` | nothing | (no undo needed) |
+| `reserve_seat` | `charge_card` | refund charge |
+| `confirm_booking` | `charge_card`, `reserve_seat` | release seat → refund charge |
+
+---
+
+## Inspecting rollback in tests
+
+After a call, `ctx.events` contains an ordered trail:
+
+```python
+book_trip("Tokyo", 412)  # book_flight raises
+
+assert book_trip.last_context.events == [
+    ("charge_card",  "executed"),
+    ("book_flight",  "executed"),   # raised
+    ("book_flight",  "rolled_back"),  # no undo= was set, so this is skipped
+    ("charge_card",  "rolled_back"),
+]
+
+assert "charge_card" in book_trip.last_context.rolled_back
 ```
 
-Run it yourself:
+`rolled_back` is the list of step names whose `undo` successfully fired.
+
+---
+
+## Try it
 
 ```bash
 python examples/side_by_side.py
 ```
 
+```
+WITHOUT dura:  customer out $412, no flight    ❌  orphaned charge
+WITH dura:     auto-refunded, charge: $0        ✅  clean exit
+```
+
 <Card title="Cookbook: booking with refund" icon="rotate-left" href="/cookbook/booking-with-refund">
-  The full booking saga, end to end.
+  Full end-to-end booking saga with three compensating actions.
 </Card>
