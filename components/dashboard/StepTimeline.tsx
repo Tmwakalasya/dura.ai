@@ -1,18 +1,18 @@
 import { STEP_STATUS } from "@/lib/status";
 import { formatDuration } from "@/lib/mock-data";
-import type { Run, Step } from "@/lib/types";
+import type { Run, Step, TimelineEntry } from "@/lib/types";
 
-/** The hero view: the ordered event stream of a run, rendered as a vertical
- *  timeline. Step events, crash markers, and resume markers are interleaved so
- *  the crash → resume → exactly-once-skip story reads top to bottom. */
-export function StepTimeline({ run }: { run: Run }) {
+/** Pure presentational timeline. Both the static server view and the live
+ *  client view render through this, so there's exactly one source of node
+ *  markup and no chance of SSR/CSR drift. */
+export function TimelineView({ entries }: { entries: TimelineEntry[] }) {
   return (
     <div className="relative pl-1">
       {/* the rail */}
       <div className="absolute bottom-2 left-[11px] top-2 w-px bg-line" />
 
       <ol className="space-y-1">
-        {run.timeline.map((entry, i) => {
+        {entries.map((entry, i) => {
           if (entry.kind === "crash") {
             return <CrashNode key={i} cause={entry.crash.cause} afterStep={entry.crash.afterStep} />;
           }
@@ -24,6 +24,11 @@ export function StepTimeline({ run }: { run: Run }) {
       </ol>
     </div>
   );
+}
+
+/** The hero view: the ordered event stream of a run. Static (server) variant. */
+export function StepTimeline({ run }: { run: Run }) {
+  return <TimelineView entries={run.timeline} />;
 }
 
 function StepNode({ step }: { step: Step }) {
