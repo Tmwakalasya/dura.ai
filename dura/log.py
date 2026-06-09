@@ -162,7 +162,20 @@ class WAL:
 
         Marks the step 'done' and clears the lease. Works whether or not a
         claim row already exists.
+
+        Raises TypeError early (before touching the DB) if `result` is not
+        JSON-serialisable — so the claim is never left in a stuck 'running'
+        state with no result.
         """
+        try:
+            result_json = json.dumps(result)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"dura: step '{step_name}' returned a non-JSON-serialisable value "
+                f"({type(result).__name__}). Step results must be dicts, lists, "
+                f"strings, numbers, bools, or None."
+            ) from exc
+
         def attempt() -> None:
             self._conn.execute(
                 "INSERT INTO steps (run_id, step_name, status, result_json, worker_id, lease_until, ts) "
@@ -170,7 +183,7 @@ class WAL:
                 "ON CONFLICT(run_id, step_name) DO UPDATE SET "
                 "status = 'done', result_json = excluded.result_json, "
                 "worker_id = excluded.worker_id, lease_until = NULL, ts = excluded.ts",
-                (run_id, step_name, json.dumps(result), self.worker_id, time.time()),
+                (run_id, step_name, result_json, self.worker_id, time.time()),
             )
             self._conn.commit()
 
@@ -185,4 +198,7 @@ class WAL:
         return [r[0] for r in rows]
 
     def close(self) -> None:
-        self._conn.close()
+        try:
+            self._conn.close()
+        except Exception:
+            pass
