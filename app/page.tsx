@@ -26,11 +26,11 @@ export default function Home() {
           ))}
         </nav>
         <div className="flex items-center gap-3">
-          <a href="#" className="hidden text-sm text-white/70 hover:text-white sm:block">
-            Sign in
+          <a href="/dashboard" className="hidden text-sm text-white/70 hover:text-white sm:block">
+            Dashboard
           </a>
           <a
-            href="#"
+            href="/dashboard"
             className="rounded-full bg-white px-4 py-1.5 text-sm font-medium text-ink transition-transform hover:scale-[1.03]"
           >
             Get started
@@ -57,7 +57,7 @@ export default function Home() {
           </p>
           <div className="mt-9 flex items-center justify-center gap-3">
             <a
-              href="#"
+              href="/dashboard"
               className="rounded-full bg-white px-5 py-2.5 text-sm font-medium text-ink transition-transform hover:scale-[1.03]"
             >
               Get started
@@ -148,7 +148,7 @@ export default function Home() {
           Close it with one import.
         </p>
         <a
-          href="#"
+          href="/dashboard"
           className="mt-8 inline-block rounded-full bg-white px-6 py-3 text-sm font-medium text-ink transition-transform hover:scale-[1.03]"
         >
           Get started free
