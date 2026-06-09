@@ -9,7 +9,7 @@ export default function Home() {
       {/* backdrop */}
       <div className="pointer-events-none absolute inset-0 bg-stars" />
       <div className="pointer-events-none absolute inset-0 grid-faint" />
-      <div className="pointer-events-none absolute left-1/2 top-[-10%] h-[520px] w-[820px] -translate-x-1/2 aurora" />
+      <div className="pointer-events-none absolute left-1/2 top-[-10%] h-[520px] w-[820px] aurora animate-aurora-breathe" />
       <div className="pointer-events-none absolute inset-x-0 bottom-0 h-[60vh] fog" />
 
       {/* nav */}
