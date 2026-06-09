@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 
+import { LiveTimeline } from "@/components/dashboard/LiveTimeline";
 import { LogPanel } from "@/components/dashboard/LogPanel";
 import { StatusPill } from "@/components/dashboard/StatusPill";
 import { StepTimeline } from "@/components/dashboard/StepTimeline";
@@ -60,7 +61,7 @@ export default function RunDetail({ params }: { params: { id: string } }) {
               <h2 className="text-sm font-medium text-white/80">Execution timeline</h2>
               <span className="font-mono text-[11px] text-white/35">top → bottom · in order</span>
             </div>
-            <StepTimeline run={run} />
+            {run.status === "running" ? <LiveTimeline run={run} /> : <StepTimeline run={run} />}
           </div>
 
           {/* side panel */}
