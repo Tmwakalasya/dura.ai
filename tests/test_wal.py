@@ -1,3 +1,5 @@
+import pytest
+
 from dura.log import WAL, MISSING
 
 
@@ -24,3 +26,19 @@ def test_steps_listed_in_commit_order(tmp_path):
     for s in ["a", "b", "c"]:
         wal.put("run1", s, s)
     assert wal.steps("run1") == ["a", "b", "c"]
+
+
+def test_non_serialisable_result_raises_before_commit(tmp_path):
+    wal = WAL(str(tmp_path / "t.db"))
+    with pytest.raises(TypeError, match="non-JSON-serialisable"):
+        wal.put("run1", "bad_step", object())
+    # The step must not appear as done — claim should not be stuck.
+    assert wal.get("run1", "bad_step") is MISSING
+
+
+def test_close_is_idempotent(tmp_path):
+    wal = WAL(str(tmp_path / "t.db"))
+    wal.put("run1", "step", {"ok": True})
+    wal.close()
+    # Second close should not raise.
+    wal.close()

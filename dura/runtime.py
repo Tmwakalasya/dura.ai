@@ -131,7 +131,7 @@ def durable(_fn: Optional[Callable] = None, *, log: str = "dura.db") -> Callable
             *args: Any,
             run_id: Optional[str] = None,
             crash_after: Optional[str] = None,
-            log: str = log,
+            log: str = log,  # noqa: A002 — intentional per-call override
             **kwargs: Any,
         ) -> Any:
             wal = WAL(log)
@@ -141,6 +141,7 @@ def durable(_fn: Optional[Callable] = None, *, log: str = "dura.db") -> Callable
                 return fn(ctx, *args, **kwargs)
             finally:
                 wrapper.last_context = ctx  # type: ignore[attr-defined]
+                wal.close()
 
         return wrapper
 
