@@ -41,6 +41,26 @@ the decorator — do not pass it yourself when calling the function.
   Can be overridden per-call with the `log=` call-time kwarg.
 </ParamField>
 
+<ParamField path="emit" type="str" default="None">
+  dura Cloud ingest URL. When set, every run and step event (started, executed,
+  skipped, failed, rolled back, completed) is streamed to this endpoint from a
+  background thread.
+
+  ```python
+  @durable(emit="https://your-dashboard.example.com/api/ingest")
+  def book_trip(ctx, dest, amount): ...
+  ```
+
+  **Emission is best-effort by design.** The local WAL stays the source of
+  truth; events are queued to a daemon thread and posted fire-and-forget. A
+  dead network, slow endpoint, or full queue can never slow down or fail the
+  workflow — visibility errors are silently dropped.
+
+  Can also be set with zero code changes via the `DURA_EMIT_URL` environment
+  variable. If `DURA_EMIT_TOKEN` is set, it is sent as a
+  `Authorization: Bearer …` header.
+</ParamField>
+
 ---
 
 ## Call-time keyword arguments
@@ -70,6 +90,15 @@ to your function:
   ```
 
   Without `run_id=`, the key is `sha256(f"{fn.__name__}:{json(args)}:{json(kwargs)}")[:12]`.
+</ParamField>
+
+<ParamField path="emit" type="str">
+  Overrides the decorator-level ingest URL for this single invocation.
+  Resolution order: call-time kwarg → decorator kwarg → `DURA_EMIT_URL` env var.
+
+  ```python
+  book_trip("Tokyo", 412, emit="https://your-dashboard.example.com/api/ingest")
+  ```
 </ParamField>
 
 <ParamField path="crash_after" type="str">
